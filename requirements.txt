@@ -8,7 +8,6 @@ PyPDF2
 langchain
 pinecone-client
 langchain-community
-langchain_google_genai
 langchain-pinecone
 datasets
 ragas
