@@ -9,8 +9,11 @@ import pptx
 import PyPDF2
 from dotenv import load_dotenv
 from pinecone import Pinecone, ServerlessSpec
-import time
-from openai import OpenAI
+import asyncio
+from langchain.chains import RetrievalQA  
+from langchain_openai import ChatOpenAI
+from langchain_openai import OpenAIEmbeddings
+from langchain_pinecone import PineconeVectorStore
 
 # Load environment variables from .env file
 load_dotenv()
@@ -18,10 +21,11 @@ load_dotenv()
 # Read API keys from environment variables
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+pinecone_env = os.getenv("PINECONE_ENVIRONMENT")
 
 # Initialize OpenAI
 openai.api_key = OPENAI_API_KEY
-client = OpenAI()
+client = openai
 
 # Initialize Pinecone instance
 pc = Pinecone(api_key=PINECONE_API_KEY)
@@ -38,9 +42,13 @@ def load_storage():
     return {'users': {}, 'collections': {}, 'uploaded_files': {}}
 
 # Save persistent storage
-def save_storage(storage):
+def save_storage():
     with open("storage.json", "w") as f:
-        json.dump(storage, f, indent=4)
+        json.dump({
+            'users': st.session_state.users,
+            'collections': st.session_state.collections,
+            'uploaded_files': st.session_state.uploaded_files
+        }, f, indent=4)
 
 # Initialize persistent storage
 storage = load_storage()
@@ -58,8 +66,10 @@ if 'selected_collection' not in st.session_state:
     st.session_state.selected_collection = None  # Track selected collection
 if 'page' not in st.session_state:
     st.session_state.page = 'login'  # Default to the login page
-if 'index_name' not in st.session_state:
-    st.session_state.index_name = None  # Store the Pinecone index name input by the user
+
+# Initialize Pinecone index state
+if 'index' not in st.session_state:
+    st.session_state.index = None
 
 # User registration
 def register(username, password):
@@ -68,7 +78,7 @@ def register(username, password):
     st.session_state.users[username] = hash_password(password)
     st.session_state.collections[username] = []
     st.session_state.uploaded_files[username] = {}
-    save_storage({'users': st.session_state.users, 'collections': st.session_state.collections, 'uploaded_files': st.session_state.uploaded_files})
+    save_storage()
     return True
 
 # User login
@@ -105,45 +115,35 @@ def add_collection(username, collection_name, index_name, uploaded_files):
     st.session_state.collections[username] = collections
     st.session_state.uploaded_files[username][collection_name] = [file.name for file in uploaded_files]
     
-    # Debugging print statements to verify storage content before saving
-    print("Debug: Before saving storage.json")
-    print("Users:", st.session_state.users)
-    print("Collections:", st.session_state.collections)
-    print("Uploaded Files:", st.session_state.uploaded_files)
-    
-    save_storage({
-        'users': st.session_state.users,
-        'collections': st.session_state.collections,
-        'uploaded_files': st.session_state.uploaded_files
-    })
+    save_storage()
 
-    # Debugging print statements to verify that data was saved
-    print("Debug: After saving storage.json")
     return "Success"
 
 # Function to process and upsert files into Pinecone
-def process_and_upsert_files(username, collection_name, index_name, uploaded_files):
+async def process_and_upsert_files(username, collection_name, index_name, uploaded_files):
     try:
         if index_name not in pc.list_indexes().names():
             pc.create_index(
                 name=index_name,
-                dimension=1536,  # Replace with appropriate dimension
+                dimension=1536,  # Ensure this matches the dimension of the OpenAI embedding model
                 metric='cosine',  # or another metric such as 'cosine'
                 spec=ServerlessSpec(cloud='aws', region='us-east-1')
             )
+        
         while not pc.describe_index(index_name).status['ready']:
-            time.sleep(1)
+            await asyncio.sleep(1)
+
         st.session_state.index = pc.Index(index_name)
 
         for uploaded_file in uploaded_files:
             if uploaded_file.type == "text/plain":
-                process_txt_file(uploaded_file, collection_name)
+                await process_txt_file(uploaded_file, collection_name)
             elif uploaded_file.type == "application/pdf":
-                process_pdf_file(uploaded_file, collection_name)
+                await process_pdf_file(uploaded_file, collection_name)
             elif uploaded_file.type == "text/csv":
-                process_csv_file(uploaded_file, collection_name)
+                await process_csv_file(uploaded_file, collection_name)
             elif uploaded_file.type == "application/vnd.openxmlformats-officedocument.presentationml.presentation":
-                process_ppt_file(uploaded_file, collection_name)
+                await process_ppt_file(uploaded_file, collection_name)
             else:
                 st.warning(f"Unsupported file type: {uploaded_file.type}")
 
@@ -153,12 +153,12 @@ def process_and_upsert_files(username, collection_name, index_name, uploaded_fil
         return f"Failed to create index or upsert files: {e}"
 
 # Function to process and upsert a text file
-def process_txt_file(file, collection_name):
+async def process_txt_file(file, collection_name):
     text = file.read().decode("utf-8")
-    upsert_to_pinecone(text, collection_name)
+    await upsert_to_pinecone(text, collection_name)
 
 # Function to process and upsert a PDF file
-def process_pdf_file(file, collection_name):
+async def process_pdf_file(file, collection_name):
     reader = PyPDF2.PdfFileReader(file)
     text = ""
     for page_num in range(reader.getNumPages()):
@@ -171,41 +171,86 @@ def process_pdf_file(file, collection_name):
         except AttributeError:
             # For older versions
             text += page.extractText()
-    upsert_to_pinecone(text, collection_name)
+    await upsert_to_pinecone(text, collection_name)
 
 # Function to process and upsert a CSV file
-def process_csv_file(file, collection_name):
+async def process_csv_file(file, collection_name):
     df = pd.read_csv(file)
     for _, row in df.iterrows():
         text = " ".join(row.astype(str).tolist())
-        upsert_to_pinecone(text, collection_name)
+        await upsert_to_pinecone(text, collection_name)
 
 # Function to process and upsert a PPT file
-def process_ppt_file(file, collection_name):
+async def process_ppt_file(file, collection_name):
     presentation = pptx.Presentation(file)
     text = ""
     for slide in presentation.slides:
         for shape in slide.shapes:
             if hasattr(shape, "text"):
                 text += shape.text
-    upsert_to_pinecone(text, collection_name)
+    await upsert_to_pinecone(text, collection_name)
 
 # Function to upsert text into Pinecone
-def upsert_to_pinecone(text, collection_name):
+async def upsert_to_pinecone(text, collection_name):
     chunks = [text[i:i + 2000] for i in range(0, len(text), 2000)]
     for chunk in chunks:
         # Create an embedding for the chunk using the client and response handling
         chunk = chunk.replace("\n", " ")  # Ensure no newlines in the text
-        response = client.embeddings.create(input=[chunk], model="text-embedding-ada-002")
-       
-        # Extract the embedding from the response
-        embedding = response.data[0].embedding
+        try:
+            st.write(f"Creating embedding for chunk: {chunk[:100]}...")  # Debugging statement
+            response = client.embeddings.create(input=[chunk], model="text-embedding-ada-002")
+            embedding = response.data[0].embedding
+            
+            # Ensure the embedding is in the correct format (list of floats)
+            if isinstance(embedding, list) and all(isinstance(x, float) for x in embedding):
+                id = hashlib.sha256(chunk.encode()).hexdigest()
+                st.session_state.index.upsert(vectors=[{"id": id,"values": embedding,"metadata": {"text": chunk}}])
+            else:
+                st.error("Failed to generate a valid embedding vector for upserting.")
+        except Exception as e:
+            st.error(f"An error occurred during embedding creation: {e}")
+
+# Function to query Pinecone index and format the answer
+def query_pinecone_index_and_format_answer(question):
+    try:
+        # Fetch the corresponding index name for the selected collection
+        selected_collection = st.session_state.selected_collection
+        index_name = None
+        for collection in st.session_state.collections[st.session_state.current_user]:
+            if collection['name'] == selected_collection:
+                index_name = collection['index_name']
+                break
         
-        # Create a unique ID for the chunk using SHA-256
-        id = hashlib.sha256(chunk.encode()).hexdigest()
-        
-        # Upsert the embedding into the Pinecone index
-        st.session_state.index.upsert(vectors=[{"id": id,"values": embedding,"metadata": {"text": chunk}}])
+        if not index_name:
+            st.error("Index name for the selected collection could not be found.")
+            return None
+
+        # Initialize the LLM and Pinecone-based retriever
+        llm = ChatOpenAI(
+            openai_api_key=OPENAI_API_KEY,
+            model_name="gpt-3.5-turbo",
+            temperature=0.0
+        )
+
+        knowledge = PineconeVectorStore.from_existing_index(
+            index_name=index_name,
+            embedding=OpenAIEmbeddings(openai_api_key=OPENAI_API_KEY)
+        )
+
+        qa = RetrievalQA.from_chain_type(
+            llm=llm,
+            chain_type="stuff",
+            retriever=knowledge.as_retriever()
+        )
+
+        # Use the RetrievalQA chain to answer the question
+        st.write("Retrieving answer...")  # Debugging statement
+        answer = qa.run(question)
+        return answer
+
+    except Exception as e:
+        st.error(f"An error occurred while querying Pinecone: {e}")
+        return None
 
 # Pages
 def show_login_page():
@@ -266,7 +311,7 @@ def show_create_collection_page():
             st.error("Pinecone Index Name cannot be empty. Please provide a valid index name.")
         else:
             # Call process_and_upsert_files with saved_index_name
-            result = process_and_upsert_files(st.session_state.current_user, collection_name, saved_index_name, uploaded_files)
+            result = asyncio.run(process_and_upsert_files(st.session_state.current_user, collection_name, saved_index_name, uploaded_files))
             if result == "Success":
                 st.success(f"Collection '{collection_name}' with index '{saved_index_name}' has been successfully created and files have been upserted.")
                 add_collection(st.session_state.current_user, collection_name, saved_index_name, uploaded_files)  # Ensure add_collection is called after success
@@ -301,8 +346,13 @@ def show_ask_questions_page():
     question = st.text_input("Ask a question")
     if st.button("Submit"):
         if question:
-            st.success(f"Question submitted: {question}")
-            # Add logic to handle the question, e.g., querying Pinecone for the answer
+            answer = query_pinecone_index_and_format_answer(question)
+            if answer:
+                st.success(f"Answer: {answer}")
+            else:
+                st.error("No relevant information found.")
+        else:
+            st.error("Please enter a question.")
 
     if st.button("Back to Collection Management"):
         st.session_state.page = 'collection_management'
