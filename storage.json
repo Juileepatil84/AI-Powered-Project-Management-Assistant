@@ -1,1 +1,22 @@
-{"users": {"s": "043a718774c572bd8a25adbeb1bfcd5c0256ae11cecf9f9c3f925d0e52beaf89"}, "collections": {"s": []}, "uploaded_files": {"s": {}}}
+{
+    "users": {
+        "s": "043a718774c572bd8a25adbeb1bfcd5c0256ae11cecf9f9c3f925d0e52beaf89"
+    },
+    "collections": {
+        "s": [
+            {
+                "name": "Collection1",
+                "index_name": "abc"
+            }
+        ]
+    },
+    "uploaded_files": {
+        "s": {
+            "Collection1": [
+                "RAG_Evaluation_Report.pdf",
+                "requirements.txt",
+                "test_rag.pdf"
+            ]
+        }
+    }
+}
